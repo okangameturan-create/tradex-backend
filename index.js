@@ -157,11 +157,13 @@ async function runTradeMonitor() {
         if (tpHit && !_notifiedTrades.has(tpKey)) {
           _notifiedTrades.add(tpKey);
 
-          // Kullanıcının FCM token'ını al
+          // Kullanıcının FCM token'ını ve bildirim tercihini al
           const userDoc = await db.collection('users').doc(trade.userId).get();
           const fcmToken = userDoc.data()?.fcmToken;
+          const notifPrefs = userDoc.data()?.notifications;
 
-          if (fcmToken) {
+          // Kullanıcı trade alertleri kapattıysa gönderme
+          if (fcmToken && notifPrefs?.tradeAlerts !== false) {
             const direction = isLong ? '📈 LONG' : '📉 SHORT';
             await sendNotification(
               fcmToken,
@@ -183,10 +185,13 @@ async function runTradeMonitor() {
         if (slHit && !_notifiedTrades.has(slKey)) {
           _notifiedTrades.add(slKey);
 
+          // Kullanıcının FCM token'ını ve bildirim tercihini al
           const userDoc = await db.collection('users').doc(trade.userId).get();
           const fcmToken = userDoc.data()?.fcmToken;
+          const notifPrefs = userDoc.data()?.notifications;
 
-          if (fcmToken) {
+          // Kullanıcı trade alertleri kapattıysa gönderme
+          if (fcmToken && notifPrefs?.tradeAlerts !== false) {
             const direction = isLong ? '📈 LONG' : '📉 SHORT';
             await sendNotification(
               fcmToken,
@@ -228,6 +233,11 @@ app.post('/api/notify/signal', async (req, res) => {
     for (const doc of usersSnap.docs) {
       const fcmToken = doc.data().fcmToken;
       if (!fcmToken) continue;
+
+      // Kullanıcı sinyal bildirimlerini kapattıysa gönderme
+      const notifPrefs = doc.data()?.notifications;
+      if (notifPrefs?.newSignals === false) continue;
+
       const ok = await sendNotification(
         fcmToken,
         `🎯 New Signal: ${symbol}`,
@@ -258,6 +268,10 @@ app.get('/api/notify/daily-summary', async (req, res) => {
       const user = doc.data();
       const fcmToken = user.fcmToken;
       if (!fcmToken) continue;
+
+      // Kullanıcı günlük özet bildirimini kapattıysa gönderme
+      const notifPrefs = user.notifications;
+      if (notifPrefs?.dailySummary === false) continue;
 
       const balance = (user.balance || 100).toFixed(2);
       const pnl = ((user.balance || 100) - 100).toFixed(2);
