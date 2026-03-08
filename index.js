@@ -3,9 +3,19 @@ const axios = require('axios');
 const NodeCache = require('node-cache');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ── Firebase Admin ────────────────────────────────────────────────────────────
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+const db = admin.firestore();
+const messaging = admin.messaging();
+console.log('[Firebase] Admin SDK initialized.');
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 const cache = new NodeCache();
@@ -13,7 +23,7 @@ const TTL = {
   TICKER:   120,  // 2 dakika
   KLINES:    60,  // 1 dakika
   EXCHANGE: 300,  // 5 dakika
-  VOLUME:   150,  // 2.5 dakika — arka plan tarama aralığından biraz uzun
+  VOLUME:   150,  // 2.5 dakika
 };
 
 // ── Binance client ────────────────────────────────────────────────────────────
@@ -46,10 +56,241 @@ async function cachedGet(cacheKey, ttl, fetchFn) {
   return { data, fromCache: false };
 }
 
-// ── Arka plan volume tarama fonksiyonu ────────────────────────────────────────
-// HTTP isteğinden bağımsız çalışır — Render 30s timeout'u etkilemez.
-// Her interval için ayrı cache key → kullanıcı hangi interval'i seçmişse
-// o zaten hazır olur.
+// ── FCM Bildirim Gönder ───────────────────────────────────────────────────────
+async function sendNotification(fcmToken, title, body, data = {}) {
+  try {
+    await messaging.send({
+      token: fcmToken,
+      notification: { title, body },
+      data,
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+          },
+        },
+      },
+    });
+    console.log(`[FCM] Sent: ${title} → ${fcmToken.substring(0, 20)}...`);
+    return true;
+  } catch (err) {
+    console.error('[FCM] Send error:', err.message);
+    // Token geçersizse Firestore'dan sil
+    if (
+      err.code === 'messaging/invalid-registration-token' ||
+      err.code === 'messaging/registration-token-not-registered'
+    ) {
+      await removeInvalidToken(fcmToken);
+    }
+    return false;
+  }
+}
+
+// Geçersiz FCM token'ı tüm kullanıcılardan temizle
+async function removeInvalidToken(fcmToken) {
+  try {
+    const snap = await db
+      .collection('users')
+      .where('fcmToken', '==', fcmToken)
+      .get();
+    for (const doc of snap.docs) {
+      await doc.ref.update({ fcmToken: admin.firestore.FieldValue.delete() });
+    }
+    console.log('[FCM] Invalid token removed.');
+  } catch (err) {
+    console.error('[FCM] Token removal error:', err.message);
+  }
+}
+
+// ── TP/SL Monitor ─────────────────────────────────────────────────────────────
+// Daha önce bildirim gönderilmiş trade ID'lerini bellekte tut
+// (Sunucu restart'ta sıfırlanır ama bu kabul edilebilir)
+const _notifiedTrades = new Set();
+let _monitorRunning = false;
+
+async function runTradeMonitor() {
+  if (_monitorRunning) return;
+  _monitorRunning = true;
+
+  try {
+    // 1. Tüm açık trade'leri çek
+    const tradesSnap = await db
+      .collection('trades')
+      .where('status', '==', 'open')
+      .get();
+
+    if (tradesSnap.empty) {
+      _monitorRunning = false;
+      return;
+    }
+
+    // 2. Benzersiz sembolleri topla
+    const symbolSet = new Set();
+    tradesSnap.docs.forEach(doc => symbolSet.add(doc.data().symbol));
+    const symbols = Array.from(symbolSet);
+
+    // 3. Binance'den anlık fiyatları çek (tek istek)
+    const priceRes = await binance.get('/api/v3/ticker/price');
+    const priceMap = {};
+    priceRes.data.forEach(t => { priceMap[t.symbol] = parseFloat(t.price); });
+
+    // 4. Her trade'i kontrol et
+    for (const doc of tradesSnap.docs) {
+      const trade = doc.data();
+      const tradeId = doc.id;
+      const currentPrice = priceMap[trade.symbol];
+
+      if (!currentPrice) continue;
+
+      const isLong = trade.type === 'long';
+      const stopLoss = trade.stopLoss ? parseFloat(trade.stopLoss) : null;
+      const takeProfit = trade.takeProfit ? parseFloat(trade.takeProfit) : null;
+
+      // TP kontrolü
+      if (takeProfit) {
+        const tpKey = `tp_${tradeId}`;
+        const tpHit = isLong
+          ? currentPrice >= takeProfit
+          : currentPrice <= takeProfit;
+
+        if (tpHit && !_notifiedTrades.has(tpKey)) {
+          _notifiedTrades.add(tpKey);
+
+          // Kullanıcının FCM token'ını al
+          const userDoc = await db.collection('users').doc(trade.userId).get();
+          const fcmToken = userDoc.data()?.fcmToken;
+
+          if (fcmToken) {
+            const direction = isLong ? '📈 LONG' : '📉 SHORT';
+            await sendNotification(
+              fcmToken,
+              '🎯 Take Profit Hit!',
+              `${direction} ${trade.symbol} TP reached at $${currentPrice.toFixed(4)}`,
+              { type: 'tp_hit', tradeId, symbol: trade.symbol }
+            );
+          }
+        }
+      }
+
+      // SL kontrolü
+      if (stopLoss) {
+        const slKey = `sl_${tradeId}`;
+        const slHit = isLong
+          ? currentPrice <= stopLoss
+          : currentPrice >= stopLoss;
+
+        if (slHit && !_notifiedTrades.has(slKey)) {
+          _notifiedTrades.add(slKey);
+
+          const userDoc = await db.collection('users').doc(trade.userId).get();
+          const fcmToken = userDoc.data()?.fcmToken;
+
+          if (fcmToken) {
+            const direction = isLong ? '📈 LONG' : '📉 SHORT';
+            await sendNotification(
+              fcmToken,
+              '🛑 Stop Loss Hit',
+              `${direction} ${trade.symbol} SL triggered at $${currentPrice.toFixed(4)}`,
+              { type: 'sl_hit', tradeId, symbol: trade.symbol }
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Monitor] Error:', err.message);
+  }
+
+  _monitorRunning = false;
+}
+
+// ── Sinyal Bildirimi ──────────────────────────────────────────────────────────
+// Flutter tarafı yeni sinyal üretince bu endpoint'i çağırır
+app.post('/api/notify/signal', async (req, res) => {
+  try {
+    const { symbol, type, strength, entryPrice } = req.body;
+
+    if (!symbol || !type) {
+      return res.status(400).json({ error: 'symbol and type required' });
+    }
+
+    // FCM token'ı olan tüm kullanıcılara bildirim gönder
+    const usersSnap = await db
+      .collection('users')
+      .where('fcmToken', '!=', null)
+      .get();
+
+    const direction = type === 'long' ? '📈 LONG' : '📉 SHORT';
+    const strengthStr = strength ? ` (${strength}% strength)` : '';
+
+    let sent = 0;
+    for (const doc of usersSnap.docs) {
+      const fcmToken = doc.data().fcmToken;
+      if (!fcmToken) continue;
+      const ok = await sendNotification(
+        fcmToken,
+        `🎯 New Signal: ${symbol}`,
+        `${direction} signal detected${strengthStr}`,
+        { type: 'new_signal', symbol, signalType: type }
+      );
+      if (ok) sent++;
+    }
+
+    res.json({ success: true, notified: sent });
+  } catch (err) {
+    console.error('[Signal Notify] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Günlük Özet Bildirimi ────────────────────────────────────────────────────
+// cron-job.org her sabah 09:00'da bu endpoint'i çağırır
+app.get('/api/notify/daily-summary', async (req, res) => {
+  try {
+    const usersSnap = await db
+      .collection('users')
+      .where('fcmToken', '!=', null)
+      .get();
+
+    let sent = 0;
+    for (const doc of usersSnap.docs) {
+      const user = doc.data();
+      const fcmToken = user.fcmToken;
+      if (!fcmToken) continue;
+
+      const balance = (user.balance || 100).toFixed(2);
+      const pnl = ((user.balance || 100) - 100).toFixed(2);
+      const pnlSign = pnl >= 0 ? '+' : '';
+      const totalTrades = user.totalTrades || 0;
+
+      const ok = await sendNotification(
+        fcmToken,
+        '📊 Your Daily TradeX Summary',
+        `Balance: $${balance} | PnL: ${pnlSign}$${pnl} | Trades: ${totalTrades}`,
+        { type: 'daily_summary' }
+      );
+      if (ok) sent++;
+    }
+
+    res.json({ success: true, notified: sent });
+  } catch (err) {
+    console.error('[Daily Summary] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Trade Monitor Endpoint ────────────────────────────────────────────────────
+// cron-job.org her 60 saniyede çağırır
+app.get('/api/monitor/check', async (req, res) => {
+  runTradeMonitor(); // fire-and-forget
+  res.json({
+    status: 'monitor_triggered',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ── Volume Arka Plan Tarama ───────────────────────────────────────────────────
 let _scanRunning = false;
 
 async function runVolumeBackgroundScan() {
@@ -63,7 +304,6 @@ async function runVolumeBackgroundScan() {
   const intervals = ['1m', '3m', '5m', '15m', '1h', '4h'];
 
   try {
-    // Adım 1: Ticker — hacimli USDT coinlerini bul
     const tickerRes = await binance.get('/api/v3/ticker/24hr', { timeout: 15000 });
     const usdtPairs = tickerRes.data
       .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 10000)
@@ -71,11 +311,9 @@ async function runVolumeBackgroundScan() {
 
     console.log(`[Volume] ${usdtPairs.length} USDT pairs found.`);
 
-    // Her interval için tarama yap
     for (const interval of intervals) {
       const cacheKey = `volume_top30_${interval}`;
 
-      // Cache hâlâ tazeyse atla
       if (cache.get(cacheKey) !== undefined) {
         console.log(`[Volume] ${interval} — cache fresh, skipping.`);
         continue;
@@ -133,7 +371,6 @@ async function runVolumeBackgroundScan() {
           }
         }
 
-        // Batch'ler arası küçük bekleme — Binance rate limit koruması
         await new Promise(res => setTimeout(res, 50));
       }
 
@@ -150,19 +387,17 @@ async function runVolumeBackgroundScan() {
   }
 }
 
-// ── Sunucu başlayınca ilk taramayı hemen yap ─────────────────────────────────
+// Sunucu başlayınca ilk taramayı hemen yap
 runVolumeBackgroundScan();
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Health check
 app.get('/health', (req, res) => {
   const intervals = ['1m', '3m', '5m', '15m', '1h', '4h'];
   const cacheStatus = {};
   for (const iv of intervals) {
     cacheStatus[iv] = cache.get(`volume_top30_${iv}`) !== undefined ? 'ready' : 'empty';
   }
-
   res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
@@ -173,14 +408,11 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Volume refresh — cron-job.org bu endpoint'i ping'ler
-// Hem servisi uyandırır hem taramayı tetikler
 app.get('/api/volume/refresh', (req, res) => {
   const hadCache = ['1m','3m','5m','15m','1h','4h']
     .map(iv => cache.get(`volume_top30_${iv}`) !== undefined)
     .filter(Boolean).length;
 
-  // Fire-and-forget — HTTP cevabını bekletmez
   runVolumeBackgroundScan();
 
   res.json({
@@ -191,7 +423,6 @@ app.get('/api/volume/refresh', (req, res) => {
   });
 });
 
-// ── 1. Tüm USDT ticker'ları ──────────────────────────────────────────────────
 app.get('/api/ticker', async (req, res) => {
   try {
     const result = await cachedGet('ticker_24hr', TTL.TICKER, async () => {
@@ -212,7 +443,6 @@ app.get('/api/ticker', async (req, res) => {
   }
 });
 
-// ── 2. Kline (mum) verisi ────────────────────────────────────────────────────
 app.get('/api/klines', async (req, res) => {
   const { symbol, interval, limit } = req.query;
 
@@ -242,7 +472,6 @@ app.get('/api/klines', async (req, res) => {
   }
 });
 
-// ── 3. Sembol listesi ────────────────────────────────────────────────────────
 app.get('/api/symbols', async (req, res) => {
   try {
     const result = await cachedGet('exchange_symbols', TTL.EXCHANGE, async () => {
@@ -262,9 +491,6 @@ app.get('/api/symbols', async (req, res) => {
   }
 });
 
-// ── 4. Volume scan — cache'den anında döner ──────────────────────────────────
-// Arka plan görevi her 2 dakikada cache'i doldurur.
-// Kullanıcı bu endpoint'e bastığında bekleme olmaz.
 app.get('/api/volume', async (req, res) => {
   const { interval } = req.query;
   const safeInterval = ['1m','3m','5m','15m','1h','4h'].includes(interval)
@@ -278,13 +504,10 @@ app.get('/api/volume', async (req, res) => {
     return res.json({ fromCache: true, data: cached });
   }
 
-  // Cache henüz dolmamış (ilk açılış) — tek seferlik bekle
   console.log(`[Volume] Cache miss for ${safeInterval}, waiting for scan...`);
 
-  // Tarama çalışmıyorsa başlat
   if (!_scanRunning) runVolumeBackgroundScan();
 
-  // Max 25 saniye bekle — 500ms'de bir kontrol et
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 500));
     const ready = cache.get(cacheKey);
@@ -293,7 +516,6 @@ app.get('/api/volume', async (req, res) => {
     }
   }
 
-  // 25 saniyede gelmezse hata döndür
   res.status(503).json({ error: 'Volume scan still in progress, please retry.' });
 });
 
