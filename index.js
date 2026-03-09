@@ -335,12 +335,14 @@ const _scanLocks = {};
 
 // Her interval için tarama sıklığı (ms)
 const VOLUME_SCHEDULE = {
-  '3m':  2  * 60 * 1000,
-  '5m':  4  * 60 * 1000,
-  '15m': 14 * 60 * 1000,
-  '1h':  55 * 60 * 1000,
-  '4h':  235 * 60 * 1000,
-  '1d':  23  * 60 * 60 * 1000,
+  // Tüm değerler asal sayı — çakışma süresi maximize edildi
+  // En sık çakışma: 3m + 5m → 13.6 saatte 1 kez
+  '3m':  173   * 1000,   // ~2.9 dk
+  '5m':  283   * 1000,   // ~4.7 dk
+  '15m': 883   * 1000,   // ~14.7 dk
+  '1h':  3299  * 1000,   // ~55.0 dk
+  '4h':  14107 * 1000,   // ~235.1 dk
+  '1d':  82799 * 1000,   // ~1380.0 dk
 };
 
 async function runVolumeScanForInterval(interval) {
