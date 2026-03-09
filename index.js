@@ -306,12 +306,22 @@ app.get('/api/monitor/check', async (req, res) => {
 
 // ── Volume Arka Plan Tarama ───────────────────────────────────────────────────
 let _scanRunning = false;
+let _rateLimitUntil = 0; // 418 rate limit sonrası cooldown
 
 async function runVolumeBackgroundScan() {
   if (_scanRunning) {
     console.log('[Volume] Scan already running, skipping.');
     return;
   }
+
+  // Rate limit cooldown aktifse atla
+  const now = Date.now();
+  if (now < _rateLimitUntil) {
+    const waitSec = Math.ceil((_rateLimitUntil - now) / 1000);
+    console.log(`[Volume] Rate limit cooldown — ${waitSec}s remaining, skipping.`);
+    return;
+  }
+
   _scanRunning = true;
   console.log('[Volume] Background scan started:', new Date().toISOString());
 
@@ -335,7 +345,7 @@ async function runVolumeBackgroundScan() {
 
       console.log(`[Volume] Scanning ${interval}...`);
       const results = [];
-      const BATCH = 20;
+      const BATCH = 10; // rate limit koruması için azaltıldı
 
       for (let i = 0; i < usdtPairs.length; i += BATCH) {
         const batch = usdtPairs.slice(i, i + BATCH);
@@ -385,16 +395,35 @@ async function runVolumeBackgroundScan() {
           }
         }
 
-        await new Promise(res => setTimeout(res, 50));
+        // 418 kontrolü
+        const hasRateLimit = batchResults.some(r =>
+          r.status === 'rejected' && r.reason?.response?.status === 418
+        );
+        if (hasRateLimit) {
+          _rateLimitUntil = Date.now() + 10 * 60 * 1000;
+          console.log(`[Volume] 418 rate limit — 10 min cooldown, aborting.`);
+          results.length = 0; // sonuçları temizle
+          break;
+        }
+
+        await new Promise(res => setTimeout(res, 400)); // 50ms → 400ms
       }
 
       results.sort((a, b) => b.v3 - a.v3);
       const top30 = results.slice(0, 30);
       cache.set(cacheKey, top30, TTL.VOLUME);
       console.log(`[Volume] ${interval} — done, ${top30.length} coins cached.`);
+
+      // Interval'lar arası 3 saniye bekle
+      await new Promise(res => setTimeout(res, 3000));
     }
   } catch (err) {
-    console.error('[Volume] Background scan error:', err.message);
+    if (err.response?.status === 418) {
+      _rateLimitUntil = Date.now() + 10 * 60 * 1000;
+      console.log('[Volume] 418 rate limit (top-level) — 10 min cooldown set.');
+    } else {
+      console.error('[Volume] Background scan error:', err.message);
+    }
   } finally {
     _scanRunning = false;
     console.log('[Volume] Background scan finished:', new Date().toISOString());
