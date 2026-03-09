@@ -484,7 +484,7 @@ app.get('/health', (req, res) => {
     uptime: Math.floor(process.uptime()),
     cacheKeys: cache.keys().length,
     volumeCache: cacheStatus,
-    scanRunning: _scanRunning,
+    scanRunning: Object.values(_scanLocks).some(Boolean),
     timestamp: new Date().toISOString(),
   });
 });
@@ -498,7 +498,7 @@ app.get('/api/volume/refresh', (req, res) => {
 
   res.json({
     status: 'scan_triggered',
-    scanAlreadyRunning: _scanRunning,
+    scanAlreadyRunning: Object.values(_scanLocks).some(Boolean),
     cachedIntervals: hadCache,
     timestamp: new Date().toISOString(),
   });
@@ -587,7 +587,7 @@ app.get('/api/volume', async (req, res) => {
 
   console.log(`[Volume] Cache miss for ${safeInterval}, waiting for scan...`);
 
-  if (!_scanRunning) runVolumeBackgroundScan();
+  if (!_scanLocks[safeInterval]) runVolumeScanForInterval(safeInterval);
 
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 500));
