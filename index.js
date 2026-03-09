@@ -20,11 +20,22 @@ console.log('[Firebase] Admin SDK initialized.');
 // ── Cache ─────────────────────────────────────────────────────────────────────
 const cache = new NodeCache();
 const TTL = {
-  TICKER:   120,  // 2 dakika
-  KLINES:    60,  // 1 dakika
-  EXCHANGE: 300,  // 5 dakika
-  VOLUME:   150,  // 2.5 dakika
+  TICKER:   120,   // 2 dakika
+  KLINES:    60,   // 1 dakika
+  EXCHANGE: 300,   // 5 dakika
 };
+
+// Her interval için ayrı TTL (saniye)
+const VOLUME_TTL = {
+  '3m':  120,       // 2 dakika
+  '5m':  240,       // 4 dakika
+  '15m': 840,       // 14 dakika
+  '1h':  3300,      // 55 dakika
+  '4h':  14100,     // 3 saat 55 dk
+  '1d':  82800,     // 23 saat
+};
+
+
 
 // ── Binance client ────────────────────────────────────────────────────────────
 const binance = axios.create({
@@ -317,27 +328,38 @@ app.get('/api/monitor/check', async (req, res) => {
 });
 
 // ── Volume Arka Plan Tarama ───────────────────────────────────────────────────
-let _scanRunning = false;
-let _rateLimitUntil = 0; // 418 rate limit sonrası cooldown
+let _rateLimitUntil = 0;
 
-async function runVolumeBackgroundScan() {
-  if (_scanRunning) {
-    console.log('[Volume] Scan already running, skipping.');
-    return;
-  }
+// Her interval için tarama kilidi — aynı anda 2 scan başlamasın
+const _scanLocks = {};
+
+// Her interval için tarama sıklığı (ms)
+const VOLUME_SCHEDULE = {
+  '3m':  2  * 60 * 1000,
+  '5m':  4  * 60 * 1000,
+  '15m': 14 * 60 * 1000,
+  '1h':  55 * 60 * 1000,
+  '4h':  235 * 60 * 1000,
+  '1d':  23  * 60 * 60 * 1000,
+};
+
+async function runVolumeScanForInterval(interval) {
+  if (_scanLocks[interval]) return;
 
   // Rate limit cooldown aktifse atla
-  const now = Date.now();
-  if (now < _rateLimitUntil) {
-    const waitSec = Math.ceil((_rateLimitUntil - now) / 1000);
-    console.log(`[Volume] Rate limit cooldown — ${waitSec}s remaining, skipping.`);
+  if (Date.now() < _rateLimitUntil) {
+    const waitSec = Math.ceil((_rateLimitUntil - Date.now()) / 1000);
+    console.log(`[Volume] Rate limit cooldown — ${waitSec}s remaining, skipping ${interval}.`);
     return;
   }
 
-  _scanRunning = true;
-  console.log('[Volume] Background scan started:', new Date().toISOString());
+  const cacheKey = `volume_top30_${interval}`;
+  if (cache.get(cacheKey) !== undefined) {
+    return; // Cache taze, taramaya gerek yok
+  }
 
-  const intervals = ['1m', '3m', '5m', '15m', '1h', '4h'];
+  _scanLocks[interval] = true;
+  console.log(`[Volume] Scanning ${interval}...`);
 
   try {
     const tickerRes = await binance.get('/api/v3/ticker/24hr', { timeout: 15000 });
@@ -345,110 +367,114 @@ async function runVolumeBackgroundScan() {
       .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 10000)
       .map(t => t.symbol);
 
-    console.log(`[Volume] ${usdtPairs.length} USDT pairs found.`);
+    const results = [];
+    const BATCH = 10;
+    let rateLimited = false;
 
-    for (const interval of intervals) {
-      const cacheKey = `volume_top30_${interval}`;
+    for (let i = 0; i < usdtPairs.length; i += BATCH) {
+      if (Date.now() < _rateLimitUntil) { rateLimited = true; break; }
 
-      if (cache.get(cacheKey) !== undefined) {
-        console.log(`[Volume] ${interval} — cache fresh, skipping.`);
-        continue;
-      }
+      const batch = usdtPairs.slice(i, i + BATCH);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (symbol) => {
+          const cKey = `klines_${symbol}_${interval}_4`;
+          const cachedKlines = cache.get(cKey);
+          let klines;
 
-      console.log(`[Volume] Scanning ${interval}...`);
-      const results = [];
-      const BATCH = 10; // rate limit koruması için azaltıldı
-
-      for (let i = 0; i < usdtPairs.length; i += BATCH) {
-        const batch = usdtPairs.slice(i, i + BATCH);
-
-        const batchResults = await Promise.allSettled(
-          batch.map(async (symbol) => {
-            const cKey = `klines_${symbol}_${interval}_4`;
-            let klines;
-
-            const cachedKlines = cache.get(cKey);
-            if (cachedKlines) {
-              klines = cachedKlines;
-            } else {
-              const r = await binance.get('/api/v3/klines', {
-                params: { symbol, interval, limit: 4 },
-                timeout: 10000,
-              });
-              klines = r.data;
-              cache.set(cKey, klines, TTL.KLINES);
-            }
-
-            if (!klines || klines.length < 3) return null;
-
-            const v1 = parseFloat(klines[0][7]) || 0;
-            const v2 = parseFloat(klines[1][7]) || 0;
-            const v3 = parseFloat(klines[2][7]) || 0;
-            const price = parseFloat(klines[klines.length - 1][4]) || 0;
-            const change1 = v1 > 0 ? (v2 - v1) / v1 * 100 : 0;
-            const change2 = v2 > 0 ? (v3 - v2) / v2 * 100 : 0;
-
-            return {
-              symbol,
-              baseAsset: symbol.replace('USDT', ''),
-              price,
-              v1, v2, v3,
-              change1,
-              change2,
-              avgChange: (change1 + change2) / 2,
-              quoteVolume: v3,
-            };
-          })
-        );
-
-        for (const r of batchResults) {
-          if (r.status === 'fulfilled' && r.value) {
-            results.push(r.value);
+          if (cachedKlines) {
+            klines = cachedKlines;
+          } else {
+            const r = await binance.get('/api/v3/klines', {
+              params: { symbol, interval, limit: 4 },
+              timeout: 10000,
+            });
+            klines = r.data;
+            cache.set(cKey, klines, TTL.KLINES);
           }
-        }
 
-        // 418 kontrolü
-        const hasRateLimit = batchResults.some(r =>
-          r.status === 'rejected' && r.reason?.response?.status === 418
-        );
-        if (hasRateLimit) {
-          _rateLimitUntil = Date.now() + 10 * 60 * 1000;
-          console.log(`[Volume] 418 rate limit — 10 min cooldown, aborting.`);
-          results.length = 0; // sonuçları temizle
-          break;
-        }
+          if (!klines || klines.length < 3) return null;
 
-        await new Promise(res => setTimeout(res, 400)); // 50ms → 400ms
+          const v1 = parseFloat(klines[0][7]) || 0;
+          const v2 = parseFloat(klines[1][7]) || 0;
+          const v3 = parseFloat(klines[2][7]) || 0;
+          const price = parseFloat(klines[klines.length - 1][4]) || 0;
+          const change1 = v1 > 0 ? (v2 - v1) / v1 * 100 : 0;
+          const change2 = v2 > 0 ? (v3 - v2) / v2 * 100 : 0;
+
+          return {
+            symbol,
+            baseAsset: symbol.replace('USDT', ''),
+            price, v1, v2, v3, change1, change2,
+            avgChange: (change1 + change2) / 2,
+            quoteVolume: v3,
+          };
+        })
+      );
+
+      const hasRateLimit = batchResults.some(r =>
+        r.status === 'rejected' && r.reason?.response?.status === 418
+      );
+      if (hasRateLimit) {
+        _rateLimitUntil = Date.now() + 10 * 60 * 1000;
+        console.log(`[Volume] 418 rate limit — 10 min cooldown, aborting ${interval}.`);
+        rateLimited = true;
+        break;
       }
 
+      for (const r of batchResults) {
+        if (r.status === 'fulfilled' && r.value) results.push(r.value);
+      }
+
+      await new Promise(res => setTimeout(res, 400));
+    }
+
+    if (!rateLimited && results.length > 0) {
       results.sort((a, b) => b.v3 - a.v3);
       const top30 = results.slice(0, 30);
-      cache.set(cacheKey, top30, TTL.VOLUME);
-      console.log(`[Volume] ${interval} — done, ${top30.length} coins cached.`);
-
-      // Interval'lar arası 3 saniye bekle
-      await new Promise(res => setTimeout(res, 3000));
+      const ttl = VOLUME_TTL[interval] || 300;
+      cache.set(cacheKey, top30, ttl);
+      console.log(`[Volume] ${interval} — done, ${top30.length} coins cached (TTL: ${ttl}s).`);
     }
   } catch (err) {
     if (err.response?.status === 418) {
       _rateLimitUntil = Date.now() + 10 * 60 * 1000;
-      console.log('[Volume] 418 rate limit (top-level) — 10 min cooldown set.');
+      console.log(`[Volume] 418 (top-level) on ${interval} — 10 min cooldown.`);
     } else {
-      console.error('[Volume] Background scan error:', err.message);
+      console.error(`[Volume] ${interval} scan error:`, err.message);
     }
   } finally {
-    _scanRunning = false;
-    console.log('[Volume] Background scan finished:', new Date().toISOString());
+    _scanLocks[interval] = false;
   }
 }
 
-// Sunucu başlayınca ilk taramayı hemen yap
-runVolumeBackgroundScan();
+// Her interval kendi zamanlamasıyla tarar
+function startVolumeSchedulers() {
+  for (const [interval, ms] of Object.entries(VOLUME_SCHEDULE)) {
+    // Hemen bir kez çalıştır
+    runVolumeScanForInterval(interval);
+    // Sonra düzenli aralıklarla tekrarla
+    setInterval(() => runVolumeScanForInterval(interval), ms);
+    console.log(`[Volume] Scheduler started for ${interval} (every ${ms/60000} min)`);
+  }
+}
+
+// /api/volume/refresh endpoint'i için — tüm interval'ları zorla tara
+async function runVolumeBackgroundScan() {
+  console.log('[Volume] Manual refresh triggered for all intervals.');
+  for (const interval of Object.keys(VOLUME_SCHEDULE)) {
+    cache.del(`volume_top30_${interval}`); // cache'i temizle, yeniden taransın
+    runVolumeScanForInterval(interval);
+    await new Promise(res => setTimeout(res, 2000)); // interval'lar arasında 2s
+  }
+}
+
+// Sunucu başlayınca scheduler'ları başlat
+startVolumeSchedulers();
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  const intervals = ['1m', '3m', '5m', '15m', '1h', '4h'];
+  const intervals = ['3m', '5m', '15m', '1h', '4h', '1d'];
   const cacheStatus = {};
   for (const iv of intervals) {
     cacheStatus[iv] = cache.get(`volume_top30_${iv}`) !== undefined ? 'ready' : 'empty';
@@ -464,7 +490,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/api/volume/refresh', (req, res) => {
-  const hadCache = ['1m','3m','5m','15m','1h','4h']
+  const hadCache = ['3m','5m','15m','1h','4h','1d']
     .map(iv => cache.get(`volume_top30_${iv}`) !== undefined)
     .filter(Boolean).length;
 
@@ -548,7 +574,7 @@ app.get('/api/symbols', async (req, res) => {
 
 app.get('/api/volume', async (req, res) => {
   const { interval } = req.query;
-  const safeInterval = ['1m','3m','5m','15m','1h','4h'].includes(interval)
+  const safeInterval = ['3m','5m','15m','1h','4h','1d'].includes(interval)
     ? interval
     : '1h';
 
