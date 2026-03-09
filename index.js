@@ -111,6 +111,13 @@ let _monitorRunning = false;
 
 async function runTradeMonitor() {
   if (_monitorRunning) return;
+
+  // Rate limit cooldown aktifse atla
+  if (Date.now() < _rateLimitUntil) {
+    console.log('[Monitor] Rate limit cooldown active, skipping.');
+    return;
+  }
+
   _monitorRunning = true;
 
   try {
@@ -204,7 +211,12 @@ async function runTradeMonitor() {
       }
     }
   } catch (err) {
-    console.error('[Monitor] Error:', err.message);
+    if (err.response?.status === 418) {
+      _rateLimitUntil = Date.now() + 10 * 60 * 1000;
+      console.log('[Monitor] 418 rate limit — 10 min cooldown set.');
+    } else {
+      console.error('[Monitor] Error:', err.message);
+    }
   }
 
   _monitorRunning = false;
