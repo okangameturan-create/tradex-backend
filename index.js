@@ -27,12 +27,13 @@ const TTL = {
 
 // Her interval için ayrı TTL (saniye)
 const VOLUME_TTL = {
-  '3m':  120,       // 2 dakika
-  '5m':  240,       // 4 dakika
-  '15m': 840,       // 14 dakika
-  '1h':  3300,      // 55 dakika
-  '4h':  14100,     // 3 saat 55 dk
-  '1d':  82800,     // 23 saat
+  // TTL'ler scan sürelerinden biraz büyük — cache asla erken dolmasın
+  '3m':  179,    // 173s scan + 6s tolerans
+  '5m':  293,    // 283s scan + 10s tolerans
+  '15m': 897,    // 883s scan + 14s tolerans
+  '1h':  3307,   // 3299s scan + 8s tolerans
+  '4h':  14117,  // 14107s scan + 10s tolerans
+  '1d':  82811,  // 82799s scan + 12s tolerans
 };
 
 
