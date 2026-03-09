@@ -365,6 +365,8 @@ async function runVolumeScanForInterval(interval) {
     const tickerRes = await binance.get('/api/v3/ticker/24hr', { timeout: 15000 });
     const usdtPairs = tickerRes.data
       .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 10000)
+      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .slice(0, 100)
       .map(t => t.symbol);
 
     const results = [];
