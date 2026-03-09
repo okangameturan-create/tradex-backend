@@ -353,7 +353,7 @@ async function runVolumeScanForInterval(interval) {
     return;
   }
 
-  const cacheKey = `volume_top30_${interval}`;
+  const cacheKey = `volume_top20_${interval}`;
   if (cache.get(cacheKey) !== undefined) {
     return; // Cache taze, taramaya gerek yok
   }
@@ -432,10 +432,10 @@ async function runVolumeScanForInterval(interval) {
 
     if (!rateLimited && results.length > 0) {
       results.sort((a, b) => b.v3 - a.v3);
-      const top30 = results.slice(0, 30);
+      const top20 = results.slice(0, 20);
       const ttl = VOLUME_TTL[interval] || 300;
-      cache.set(cacheKey, top30, ttl);
-      console.log(`[Volume] ${interval} — done, ${top30.length} coins cached (TTL: ${ttl}s).`);
+      cache.set(cacheKey, top20, ttl);
+      console.log(`[Volume] ${interval} — done, ${top20.length} coins cached (TTL: ${ttl}s).`);
     }
   } catch (err) {
     if (err.response?.status === 418) {
@@ -464,7 +464,7 @@ function startVolumeSchedulers() {
 async function runVolumeBackgroundScan() {
   console.log('[Volume] Manual refresh triggered for all intervals.');
   for (const interval of Object.keys(VOLUME_SCHEDULE)) {
-    cache.del(`volume_top30_${interval}`); // cache'i temizle, yeniden taransın
+    cache.del(`volume_top20_${interval}`); // cache'i temizle, yeniden taransın
     runVolumeScanForInterval(interval);
     await new Promise(res => setTimeout(res, 2000)); // interval'lar arasında 2s
   }
@@ -479,7 +479,7 @@ app.get('/health', (req, res) => {
   const intervals = ['3m', '5m', '15m', '1h', '4h', '1d'];
   const cacheStatus = {};
   for (const iv of intervals) {
-    cacheStatus[iv] = cache.get(`volume_top30_${iv}`) !== undefined ? 'ready' : 'empty';
+    cacheStatus[iv] = cache.get(`volume_top20_${iv}`) !== undefined ? 'ready' : 'empty';
   }
   res.json({
     status: 'ok',
@@ -493,7 +493,7 @@ app.get('/health', (req, res) => {
 
 app.get('/api/volume/refresh', (req, res) => {
   const hadCache = ['3m','5m','15m','1h','4h','1d']
-    .map(iv => cache.get(`volume_top30_${iv}`) !== undefined)
+    .map(iv => cache.get(`volume_top20_${iv}`) !== undefined)
     .filter(Boolean).length;
 
   runVolumeBackgroundScan();
@@ -580,7 +580,7 @@ app.get('/api/volume', async (req, res) => {
     ? interval
     : '1h';
 
-  const cacheKey = `volume_top30_${safeInterval}`;
+  const cacheKey = `volume_top20_${safeInterval}`;
   const cached = cache.get(cacheKey);
 
   if (cached) {
