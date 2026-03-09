@@ -451,13 +451,15 @@ async function runVolumeScanForInterval(interval) {
 
 // Her interval kendi zamanlamasıyla tarar
 function startVolumeSchedulers() {
-  for (const [interval, ms] of Object.entries(VOLUME_SCHEDULE)) {
-    // Hemen bir kez çalıştır
-    runVolumeScanForInterval(interval);
-    // Sonra düzenli aralıklarla tekrarla
-    setInterval(() => runVolumeScanForInterval(interval), ms);
-    console.log(`[Volume] Scheduler started for ${interval} (every ${ms/60000} min)`);
-  }
+  const entries = Object.entries(VOLUME_SCHEDULE);
+  entries.forEach(([interval, ms], i) => {
+    // Her interval'ı 15 saniye arayla başlat — aynı anda patlamayı önler
+    setTimeout(() => {
+      runVolumeScanForInterval(interval);
+      setInterval(() => runVolumeScanForInterval(interval), ms);
+      console.log(`[Volume] Scheduler started for ${interval} (every ${ms/60000} min)`);
+    }, i * 15000); // 0s, 15s, 30s, 45s, 60s, 75s
+  });
 }
 
 // /api/volume/refresh endpoint'i için — tüm interval'ları zorla tara
@@ -466,7 +468,7 @@ async function runVolumeBackgroundScan() {
   for (const interval of Object.keys(VOLUME_SCHEDULE)) {
     cache.del(`volume_top20_${interval}`); // cache'i temizle, yeniden taransın
     runVolumeScanForInterval(interval);
-    await new Promise(res => setTimeout(res, 2000)); // interval'lar arasında 2s
+    await new Promise(res => setTimeout(res, 120000)); // interval'lar arasında 120s
   }
 }
 
